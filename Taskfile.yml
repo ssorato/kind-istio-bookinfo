@@ -1,0 +1,233 @@
+version: '3'
+
+vars:
+  INGRESS_IP: 172.28.184.181 # Nginx Ingress Controller service load balancer IP
+  METALLB_ADDRS: 172.18.250.200-172.18.250.250 # docker network inspect -f '{{.IPAM.Config}}' kind
+  ISTIO_VERSION: 1.22.1
+  TARGET_ARCH: x86_64 # arm64
+  ISTIOCTL: "{{.PWD}}/istio-{{.ISTIO_VERSION}}/bin/istioctl"
+
+tasks:
+
+  default:
+    desc: "Main task"
+    deps: 
+      - task: bookinfo
+
+  create-kind-cluster:
+    desc: Create the kubernet cluster using Kind
+    run: once 
+    cmds:
+      - |-
+        kind get clusters -q | grep -w istio  || \
+        cat <<EOT | kind create cluster --config -
+        apiVersion: kind.x-k8s.io/v1alpha4
+        kind: Cluster
+        name: istio
+        nodes:
+        - role: control-plane
+          kubeadmConfigPatches:
+          - |
+            kind: InitConfiguration
+            nodeRegistration:
+              kubeletExtraArgs:
+                node-labels: "ingress-ready=true"
+          extraPortMappings:
+          - containerPort: 80
+            hostPort: 80
+            protocol: TCP
+            listenAddress: "{{.INGRESS_IP}}"
+          - containerPort: 443
+            hostPort: 443
+            protocol: TCP
+            listenAddress: "{{.INGRESS_IP}}"
+        - role: worker
+          labels:
+            nodeType: worker
+        - role: worker
+          labels:
+            nodeType: worker
+        EOT
+
+  metallb:
+    desc: Install bare metal load-balancer for Kubernetes
+    run: once
+    deps:
+      - task: create-kind-cluster
+    cmds:
+      - kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
+      - kubectl -n metallb-system wait --for=condition=Ready pods --all --timeout=90s
+      - |-
+        cat  <<EOT | kubectl apply -f -
+        apiVersion: metallb.io/v1beta1
+        kind: IPAddressPool
+        metadata:
+          name: first-pool
+          namespace: metallb-system
+        spec:
+          addresses:
+            - {{.METALLB_ADDRS}}
+          autoAssign: true
+
+        ---
+        apiVersion: metallb.io/v1beta1
+        kind: L2Advertisement
+        metadata:
+          name: default
+          namespace: metallb-system
+        spec:
+          ipAddressPools:
+            - first-pool
+        EOT
+
+  istio:
+    desc: Install Istio
+    run: once
+    deps:
+      - task: metallb
+    cmds:
+      - |-
+        [ -d istio-{{.ISTIO_VERSION}} ] && echo Istio {{.ISTIO_VERSION}} already downloaded || \
+        curl -s -L https://istio.io/downloadIstio | ISTIO_VERSION={{.ISTIO_VERSION}} TARGET_ARCH={{.TARGET_ARCH}} sh - && \
+        sed -i 's/^    identity:/      grafana:\n        url: "http:\/\/grafana:3000"\n    identity:/' istio-{{.ISTIO_VERSION}}/samples/addons/kiali.yaml
+        {{.ISTIOCTL}} version --remote=false
+        {{.ISTIOCTL}} x precheck
+        {{.ISTIOCTL}} install --set profile=demo -y
+      - kubectl -n istio-system get pods
+      - kubectl -n istio-system wait --for=condition=Ready pods --all --timeout=90s
+      - |-
+        kubectl patch deployments.apps -n istio-system istio-ingressgateway -p '{"spec":{"template":{"spec":{"containers":[{"name":"istio-proxy","ports":[{"containerPort":8080,"hostPort":80},{"containerPort":8443,"hostPort":443}]}]}}}}'
+        kubectl patch deployments.apps -n istio-system istio-ingressgateway -p '{"spec": {"template": {"spec": {"tolerations": [{"effect": "NoSchedule","key": "node-role.kubernetes.io/control-plane","operator": "Exists"}]}}}}'
+        kubectl patch deployments.apps -n istio-system istio-ingressgateway -p '{"spec": {"template": {"spec": {"nodeSelector": {"ingress-ready": "true"}}}}}'
+      - sleep 5 && kubectl wait deployment -n istio-system istio-ingressgateway --for condition=Available=True --timeout=90s # review !!!
+
+  addons:
+    desc: Install addons
+    run: once
+    deps:
+      - task: istio
+    cmds:
+      - |-
+        sed -i "s/domain = ''/domain = 'addons.{{.INGRESS_IP}}.nip.io'\n    protocol: http\n    root_url: \"%\(protocol\)s:\/\/%\(domain\)s\/grafana\/\"\n    serve_from_sub_path = false\n/" istio-1.22.1/samples/addons/grafana.yaml
+        sed -i "s/--web.enable-lifecycle/--web.enable-lifecycle\n            - --web.external-url=https:\/\/localhost:9090\/prometheus\/\n            - --web.route-prefix=\/\n/" istio-1.22.1/samples/addons/prometheus.yaml
+      - kubectl apply -f istio-{{.ISTIO_VERSION}}/samples/addons
+      - kubectl rollout status deployment/kiali -n istio-system
+      - kubectl -n istio-system wait --for=condition=Ready pods -l app.kubernetes.io/instance=prometheus --timeout=90s
+      - kubectl -n istio-system wait --for=condition=Ready pods -l app.kubernetes.io/instance=grafana --timeout=90s
+      - kubectl -n istio-system wait --for=condition=Ready pods -l app=jaeger --timeout=90s
+      - kubectl -n istio-system wait --for=condition=Ready pods -l app.kubernetes.io/instance=loki --timeout=90s
+      - kubectl -n istio-system wait --for=condition=Ready pods -l app.kubernetes.io/instance=kiali --timeout=90s
+      - |-
+        cat <<EOT | kubectl -n istio-system apply -f -
+        apiVersion: networking.istio.io/v1alpha3
+        kind: Gateway
+        metadata:
+          name: addons-gateway
+        spec:
+          selector:
+            istio: ingressgateway
+          servers:
+          - port:
+              number: 80
+              name: http
+              protocol: HTTP
+            hosts:
+            - addons.{{.INGRESS_IP}}.nip.io
+
+        ---
+        apiVersion: networking.istio.io/v1alpha3
+        kind: VirtualService
+        metadata:
+          name: addons
+        spec:
+          hosts:
+          - '*'
+          gateways:
+          - addons-gateway
+          http:
+            - name: kiali-route
+              match:
+                - uri:
+                    prefix: /kiali/
+              route:
+                - destination:
+                    host: kiali
+                    port:
+                      number: 20001
+            - name: kiali-route
+              match:
+                - uri:
+                    prefix: /jaeger/
+              route:
+                - destination:
+                    host: tracing
+                    port:
+                      number: 80
+            - name: grafana-route
+              match:
+                - uri:
+                    prefix: /grafana/
+              rewrite:
+                uri: /
+              route:
+                - destination:
+                    host: grafana
+                    port:
+                      number: 3000
+            - name: prometheus-route
+              match:
+                - uri:
+                    prefix: /prometheus/
+              rewrite:
+                uri: /
+              route:
+                - destination:
+                    host: prometheus
+                    port:
+                      number: 9090
+            - name: jeager-route
+              match:
+                - uri:
+                    prefix: /jeager/
+              rewrite:
+                uri: /jaeger/search
+              route:
+                - destination:
+                    host: tracing
+                    port:
+                      number: 80
+        EOT
+      - echo "Kiali is avaliable at http://addons.{{.INGRESS_IP}}.nip.io/kiali/"
+      - echo "Prometheus is avaliable at http://addons.{{.INGRESS_IP}}.nip.io/prometheus/"
+      - echo "Grafana is avaliable at http://addons.{{.INGRESS_IP}}.nip.io/grafana/"
+      - echo "Jeager is avaliable at http://addons.{{.INGRESS_IP}}.nip.io/jeager/search"
+
+  bookinfo:
+    desc: Deploy Bookinfo application
+    deps:
+      - task: addons
+    cmds:
+      #- kubectl get ns | grep ^bookinfo > /dev/null 2>&1 && echo Namespace bookinfo already exits || kubectl create ns bookinfo
+      - kubectl label namespace default istio-injection=enabled
+      - kubectl -n default apply -f istio-{{.ISTIO_VERSION}}/samples/bookinfo/platform/kube/bookinfo.yaml
+      - kubectl -n default wait --for=condition=Ready pods --all --timeout=360s
+      - kubectl apply -f istio-{{.ISTIO_VERSION}}/samples/bookinfo/networking/bookinfo-gateway.yaml
+      - |-
+        kubectl patch gateways bookinfo-gateway --type=json \
+        -p '''
+        [{ "op": "replace", 
+          "path": "/spec/servers/0/hosts/0", 
+          "value": "bookinfo.{{.INGRESS_IP}}.nip.io"
+        }]'''
+      - kubectl apply -f istio-{{.ISTIO_VERSION}}/samples/bookinfo/networking/destination-rule-all.yaml
+      - echo "Bookinfo is avaliable at http://bookinfo.{{.INGRESS_IP}}.nip.io/productpage"
+
+  destroy:
+    desc: Destroy the kubernet cluster
+    run: once
+    prompt: This will delete the Kind cluster. Do you want to continue?
+    cmds:
+      - kind delete cluster --name istio
+      - kind get clusters
+      - rm -rf istio-{{.ISTIO_VERSION}}
+
