@@ -21,7 +21,7 @@ $ docker network inspect -f '{{.IPAM.Config}}' kind
 Start the pipeline:
 
 ```bash
-$ taks
+$ task
 ```
 
 Open Bookinfo page at `http://bookinfo.<INGRESS_IP>.nip.io/productpage`
@@ -34,7 +34,7 @@ Open Bookinfo page at `http://bookinfo.<INGRESS_IP>.nip.io/productpage`
 ## Cleanup
 
 ```bash
-$ taks destroy
+$ task destroy
 ```
 
 ## References
